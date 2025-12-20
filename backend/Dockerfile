@@ -30,4 +30,4 @@ COPY . .
 EXPOSE 3000
 
 # 10. Start the server
-CMD ["node", "server.mjs"]
+CMD ["npm run dev"]
