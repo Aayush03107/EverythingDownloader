@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url'; // <--- 1. Import this
 
 // Import Routes
 import youtubeRoutes from './routes/youtube.mjs';
-import { startJanitor } from './utils/janitor.mjs';
+import { startJanitor } from './utitlis/janitor.mjs';
 
 // --- 2. FIX: Define __dirname manually ---
 const __filename = fileURLToPath(import.meta.url);
