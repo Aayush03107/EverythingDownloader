@@ -2,10 +2,10 @@
 import express from 'express';
 import { spawn, exec } from 'child_process';
 import path from 'path';
-import fs from 'fs';
-import { uid } from 'uid';
+import fs from 'fs';import { uid } from 'uid';
 import { fileURLToPath } from 'url';
 import * as cheerio from 'cheerio';
+//import uid from 'uid-safe';
 
 // --- UTILS ---
 import { validateURL } from '../utitlis/security.mjs';
@@ -218,12 +218,24 @@ router.get('/formats', async (req, res) => {
 });
 
 // 5. CONVERT ROUTE (With Queue Integration)
+const getFreeDiskSpace = () => {
+    return new Promise((resolve) => {
+        // 'df -m' returns disk space in Megabytes
+        exec('df -m /', (err, stdout) => {
+            if (err) return resolve(1024); // Default to 1GB if check fails
+            const lines = stdout.split('\n');
+            const parts = lines[1].replace(/\s+/g, ' ').split(' ');
+            const availableMB = parseInt(parts[3]);
+            resolve(availableMB);
+        });
+    });
+};
+
 router.post('/convert', async (req, res) => {
     const { url, format, quality, requestId } = req.body;
     if (!url) return res.status(400).json({ error: "No URL" });
 
-    // Strict Checks
-    if (!limiter.check(req.ip, 10)) return res.status(429).json({ error: "Server busy. Try later." });
+    // 1. Pre-Check: URL Validation
     if (!(await validateURL(url))) return res.status(403).json({ error: "Forbidden URL" });
 
     const sendUpdate = (data) => {
@@ -236,103 +248,95 @@ router.post('/convert', async (req, res) => {
         console.log(`[Queue] Starting Job: ${requestId}`);
         sendUpdate({ status: 'Downloading', progress: 0, total: '...', speed: '...' });
 
-        const fileId = uid(16);
-        const downloadFolder = path.join(rootDir, 'downloads');
-        if (!fs.existsSync(downloadFolder)) fs.mkdirSync(downloadFolder);
-        const outputTemplate = path.join(downloadFolder, `${fileId}.%(ext)s`);
+        // 2. PRE-CHECK: SIZE AND DISK SPACE
+        // Use --get-size to ask YouTube for the file size before downloading
+        exec(`yt-dlp --get-size "${url}"`, async (err, stdout) => {
+            const freeSpace = await getFreeDiskSpace();
+            const isTooLarge = stdout.includes('G') || (stdout.includes('M') && parseFloat(stdout) > 500);
 
-        const baseArgs = ['--newline', '--no-warnings']; 
-        let args = [];
-
-        // Build Args (Spotify or Standard)
-        if (isSpotifyUrl(url)) {
-            const spotifyMeta = await getSpotifyMeta(url);
-            const targetUrl = `ytsearch1:"${spotifyMeta.searchQuery}"`;
-            if (format === 'mp3') args = [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', '-o', outputTemplate, targetUrl];
-            else args = [...baseArgs, '-S', 'ext:mp4:m4a', '-o', outputTemplate, targetUrl];
-        } else {
-            const playlistArgs = url.includes('list=') ? ['--playlist-items', '1'] : [];
-            if (format === 'mp3') {
-                args = [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', ...playlistArgs, '-o', outputTemplate, url];
-            } else {
-                if (quality) {
-                    args = [...baseArgs, '-f', `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`, '--merge-output-format', 'mp4', ...playlistArgs, '-o', outputTemplate, url];
-                } else {
-                    args = [...baseArgs, '-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', ...playlistArgs, '-o', outputTemplate, url];
-                }
+            if (isTooLarge || freeSpace < 200) {
+                sendUpdate({ status: 'Error', message: 'File too large or server disk full' });
+                if (!res.headersSent) res.status(400).json({ error: "Server Capacity Exceeded" });
+                downloadQueue.next(); // Continue to next person in queue
+                return;
             }
-        }
 
-        const ytDlpProcess = spawn('yt-dlp', args);
-        activeTasks.set(requestId, { process: ytDlpProcess, res });
+            const fileId = uid(16);
+            const downloadFolder = path.join(rootDir, 'downloads');
+            if (!fs.existsSync(downloadFolder)) fs.mkdirSync(downloadFolder);
+            const outputTemplate = path.join(downloadFolder, `${fileId}.%(ext)s`);
 
-        let dataBuffer = '';
-        const progressRegex = /\[download\]\s+(\d+\.?\d*)%\s+of\s+(~?[\d\.]+\w+)/;
-        const speedRegex = /at\s+(\S+)/;
+            // Build Args
+            const baseArgs = ['--newline', '--no-warnings', '--max-filesize', '500M']; 
+            let args = [];
 
-        ytDlpProcess.stdout.on('data', (data) => {
-            dataBuffer += data.toString();
-            let lines = dataBuffer.split('\n');
-            dataBuffer = lines.pop(); 
+            if (format === 'mp3') {
+                args = [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', '-o', outputTemplate, url];
+            } else {
+                args = [...baseArgs, '-f', `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`, '--merge-output-format', 'mp4', '-o', outputTemplate, url];
+            }
 
-            lines.forEach(line => {
-                if (!line.includes('[download]')) return;
-                const match = line.match(progressRegex);
-                const speedMatch = line.match(speedRegex);
+            const ytDlpProcess = spawn('yt-dlp', args);
+            activeTasks.set(requestId, { process: ytDlpProcess, res });
 
-                if (match) {
-                    const percent = parseFloat(match[1]);
-                    if (!isNaN(percent)) {
+            // 3. ATOMIC KILL SWITCH: If user cancels or closes tab
+            req.on('close', () => {
+                console.log(`[Safety] User cancelled. Killing process ${requestId}`);
+                ytDlpProcess.kill('SIGKILL');
+                // Cleanup any partial files immediately
+                const partialFile = path.join(downloadFolder, `${fileId}.${format}`);
+                if (fs.existsSync(partialFile)) fs.unlink(partialFile, () => {});
+            });
+
+            let dataBuffer = '';
+            const progressRegex = /\[download\]\s+(\d+\.?\d*)%\s+of\s+(~?[\d\.]+\w+)/;
+
+            ytDlpProcess.stdout.on('data', (data) => {
+                dataBuffer += data.toString();
+                let lines = dataBuffer.split('\n');
+                dataBuffer = lines.pop(); 
+                lines.forEach(line => {
+                    if (!line.includes('[download]')) return;
+                    const match = line.match(progressRegex);
+                    if (match) {
                         sendUpdate({ 
-                            progress: percent, 
-                            total: match[2],
-                            speed: speedMatch ? speedMatch[1] : null,
-                            status: 'Downloading'
+                            progress: parseFloat(match[1]), 
+                            total: match[2], 
+                            status: 'Downloading' 
+                        });
+                    }
+                });
+            });
+
+            ytDlpProcess.on('close', (code, signal) => {
+                downloadQueue.next();
+                activeTasks.delete(requestId);
+
+                if (signal === 'SIGKILL' || code !== 0) {
+                    if (!res.headersSent) res.status(500).json({ error: "Job Interrupted" });
+                    return;
+                }
+
+                sendUpdate({ progress: 100, status: 'Complete' });
+
+                const expectedFile = path.join(downloadFolder, `${fileId}.${format}`);
+                if (fs.existsSync(expectedFile)) {
+                    if (!res.headersSent) {
+                        res.download(expectedFile, `download.${format}`, (err) => {
+                            // 4. FINAL CLEANUP: Delete file immediately after successful or failed transfer
+                            fs.unlink(expectedFile, () => {
+                                console.log(`[Cleanup] Deleted ${fileId}`);
+                            });
                         });
                     }
                 }
             });
         });
-
-        ytDlpProcess.on('close', (code, signal) => {
-            // --- QUEUE HANDOFF: Call Next Job ---
-            downloadQueue.next();
-
-            activeTasks.delete(requestId);
-            if (signal === 'SIGKILL') return; // Cancelled
-
-            if (code !== 0) {
-                sendUpdate({ status: 'Error' });
-                // Note: We cannot send 500 here if headers were already flushed, 
-                // but since we rely on SSE for status, that's okay.
-                // If we haven't sent headers for the POST, we do it now.
-                if (!res.headersSent) res.status(500).json({ error: "Download failed" });
-                return;
-            }
-
-            sendUpdate({ progress: 100, status: 'Complete' });
-
-            const expectedFile = path.join(downloadFolder, `${fileId}.${format}`);
-            if (fs.existsSync(expectedFile)) {
-                // If headers not sent yet, we send the file
-                if (!res.headersSent) {
-                    res.download(expectedFile, `download.${format}`, (err) => {
-                        if (!err) fs.unlink(expectedFile, () => {});
-                    });
-                }
-            } else {
-                if (!res.headersSent) res.status(500).json({ error: "File not found" });
-            }
-        });
     };
 
-    // --- ADD TO QUEUE ---
     const result = downloadQueue.add(requestId, startJob);
-
     if (result.status === 'queued') {
         sendUpdate({ status: 'Queued', position: result.position });
-        // We keep the POST request hanging until the job starts and finishes
-        // (Or until timeout).
     }
 });
 

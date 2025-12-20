@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url'; // <--- 1. Import this
 
 // Import Routes
 import youtubeRoutes from './routes/youtube.mjs';
+import playlistRoutes from './routes/playlist.mjs'
 import { startJanitor } from './utitlis/janitor.mjs';
 
 // --- 2. FIX: Define __dirname manually ---
@@ -24,6 +25,7 @@ app.use(express.json());
 startJanitor(__dirname, 10, 30);
 
 // Routes
+app.use('/api/playlist', playlistRoutes);
 app.use('/', youtubeRoutes);
 
 app.listen(PORT, () => {
