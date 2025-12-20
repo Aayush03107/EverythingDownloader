@@ -207,7 +207,7 @@ const Converter = () => {
         });
 
         if (!response.ok) throw new Error('Download failed');
-        
+        setStatus('Finalizing... (Sending file to browser)');
         const blob = await response.blob();
         const dUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
