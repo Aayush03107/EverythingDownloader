@@ -382,7 +382,7 @@ const Converter = () => {
               <button
                 onClick={handleDownloadAction}
                 disabled={loading || (isPlaylist && selectedVideos.size === 0)}
-                className="flex-1 px-6 py-3 rounded-lg bg-red-600 hover:bg-red-700 font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
+                className="flex-1 px-6 py-3 rounded-lg bg-red-600 hover:bg-red-700 font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all active:scale-[0.98] cursor-pointer"
               >
                 {loading ? (isPlaylist ? `Processing Batch...` : `${Math.round(progress)}%`) : (isPlaylist ? `Download ${selectedVideos.size} Items` : 'Download')}
               </button>
