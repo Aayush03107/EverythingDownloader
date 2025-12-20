@@ -182,7 +182,7 @@ const Converter = () => {
       if (response.status === 429) throw new Error("Server busy. Please try again later.");
       
       if (!response.ok) throw new Error('Download failed');
-      
+      setStatus('Finalizing... (Sending file to browser)');
       const blob = await response.blob();
       const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
