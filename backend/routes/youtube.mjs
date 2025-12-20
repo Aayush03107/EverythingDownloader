@@ -2,14 +2,14 @@
 import express from 'express';
 import { spawn, exec } from 'child_process';
 import path from 'path';
-import fs from 'fs';import { uid } from 'uid';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import * as cheerio from 'cheerio';
-//import uid from 'uid-safe';
+import uid from 'uid-safe'; // Use uid-safe for file IDs
 
-// --- UTILS ---
+// --- UTILS (Fixed Spelling) ---
 import { validateURL } from '../utitlis/security.mjs';
-import { Cache, RateLimiter } from '../utitlis/limiter.mjs'; // Phase 2
+import { Cache, RateLimiter } from '../utitlis/limiter.mjs';
 import { JobQueue } from '../utitlis/queue.mjs';
 
 const router = express.Router();
@@ -18,16 +18,29 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.join(__dirname, '..');
 
 // --- INIT SYSTEMS ---
-const metaCache = new Cache(30); // 30 min TTL
-const limiter = new RateLimiter(60, 60); // 60 reqs / 60 secs
-const downloadQueue = new JobQueue(2); // Max 2 concurrent downloads
+const metaCache = new Cache(30); 
+const limiter = new RateLimiter(60, 60); 
+const downloadQueue = new JobQueue(2); 
 
 // --- GLOBAL STATE ---
-const activeTasks = new Map(); // requestId -> { process, res }
-const clients = new Map();     // requestId -> Response (SSE)
+const activeTasks = new Map(); 
+const clients = new Map();      
+const completedJobs = new Map(); // Stores paths of finished files for pickup
 
 // --- HELPERS ---
 const isSpotifyUrl = (url) => url.includes('spotify');
+
+const getFreeDiskSpace = () => {
+    return new Promise((resolve) => {
+        exec('df -m /', (err, stdout) => {
+            if (err) return resolve(1024);
+            const lines = stdout.split('\n');
+            const parts = lines[1].replace(/\s+/g, ' ').split(' ');
+            const availableMB = parseInt(parts[3]);
+            resolve(availableMB);
+        });
+    });
+};
 
 const getSpotifyMeta = async (url) => {
     try {
@@ -88,23 +101,19 @@ const getUniversalMeta = (url) => {
 
 // --- ROUTES ---
 
-// 1. CANCEL ROUTE (Updated for Queue)
+// 1. CANCEL ROUTE
 router.post('/cancel', (req, res) => {
     const { requestId } = req.body;
     
-    // A. Check Active Downloads
     if (activeTasks.has(requestId)) {
         const task = activeTasks.get(requestId);
         if (task.process) task.process.kill('SIGKILL');
         activeTasks.delete(requestId);
-        // Note: The 'close' event in /convert will handle calling queue.next()
         return res.json({ status: 'cancelled_active' });
     }
 
-    // B. Check Waiting Queue
     const wasInQueue = downloadQueue.removeFromQueue(requestId);
     if (wasInQueue) {
-        // Manually notify frontend because no process exists to fire 'close'
         const clientRes = clients.get(requestId);
         if (clientRes) {
             clientRes.write(`data: ${JSON.stringify({ status: 'Cancelled' })}\n\n`);
@@ -132,16 +141,13 @@ router.get('/events', (req, res) => {
     });
 });
 
-// 3. META ROUTE (Protected + Cached)
+// 3. META ROUTE
 router.get('/meta', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "No URL" });
-
-    // Rate Limit & Security
     if (!limiter.check(req.ip, 1)) return res.status(429).json({ error: "Too many requests" });
     if (!(await validateURL(url))) return res.status(403).json({ error: "Forbidden URL" });
 
-    // Cache Check
     const cached = metaCache.get(url);
     if (cached) return res.json(cached);
 
@@ -157,16 +163,13 @@ router.get('/meta', async (req, res) => {
     return res.status(500).json({ error: "Link not supported" });
 });
 
-// 4. FORMATS ROUTE (Protected + Cached)
+// 4. FORMATS ROUTE
 router.get('/formats', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.json({ formats: [] });
-
-    // Silent fail checks
     if (!limiter.check(req.ip, 1)) return res.json({ formats: [] });
     if (!(await validateURL(url))) return res.json({ formats: [] });
 
-    // Cache Check
     const cacheKey = `fmt:${url}`;
     const cached = metaCache.get(cacheKey);
     if (cached) return res.json({ formats: cached });
@@ -217,25 +220,11 @@ router.get('/formats', async (req, res) => {
     });
 });
 
-// 5. CONVERT ROUTE (With Queue Integration)
-const getFreeDiskSpace = () => {
-    return new Promise((resolve) => {
-        // 'df -m' returns disk space in Megabytes
-        exec('df -m /', (err, stdout) => {
-            if (err) return resolve(1024); // Default to 1GB if check fails
-            const lines = stdout.split('\n');
-            const parts = lines[1].replace(/\s+/g, ' ').split(' ');
-            const availableMB = parseInt(parts[3]);
-            resolve(availableMB);
-        });
-    });
-};
-
+// 5. CONVERT ROUTE (The Start Point)
 router.post('/convert', async (req, res) => {
     const { url, format, quality, requestId } = req.body;
     if (!url) return res.status(400).json({ error: "No URL" });
 
-    // 1. Pre-Check: URL Validation
     if (!(await validateURL(url))) return res.status(403).json({ error: "Forbidden URL" });
 
     const sendUpdate = (data) => {
@@ -243,21 +232,20 @@ router.post('/convert', async (req, res) => {
         if (clientRes) clientRes.write(`data: ${JSON.stringify(data)}\n\n`);
     };
 
-    // --- JOB DEFINITION ---
     const startJob = async () => {
         console.log(`[Queue] Starting Job: ${requestId}`);
         sendUpdate({ status: 'Downloading', progress: 0, total: '...', speed: '...' });
 
-        // 2. PRE-CHECK: SIZE AND DISK SPACE
-        // Use --get-size to ask YouTube for the file size before downloading
+        // Pre-Check: Size & Disk
         exec(`yt-dlp --get-size "${url}"`, async (err, stdout) => {
             const freeSpace = await getFreeDiskSpace();
             const isTooLarge = stdout.includes('G') || (stdout.includes('M') && parseFloat(stdout) > 500);
 
             if (isTooLarge || freeSpace < 200) {
                 sendUpdate({ status: 'Error', message: 'File too large or server disk full' });
-                if (!res.headersSent) res.status(400).json({ error: "Server Capacity Exceeded" });
-                downloadQueue.next(); // Continue to next person in queue
+                // Note: We cannot send res.json here because we already sent it below!
+                // The frontend relies on the SSE 'Error' status.
+                downloadQueue.next(); 
                 return;
             }
 
@@ -266,7 +254,6 @@ router.post('/convert', async (req, res) => {
             if (!fs.existsSync(downloadFolder)) fs.mkdirSync(downloadFolder);
             const outputTemplate = path.join(downloadFolder, `${fileId}.%(ext)s`);
 
-            // Build Args
             const baseArgs = ['--newline', '--no-warnings', '--max-filesize', '500M']; 
             let args = [];
 
@@ -277,15 +264,17 @@ router.post('/convert', async (req, res) => {
             }
 
             const ytDlpProcess = spawn('yt-dlp', args);
-            activeTasks.set(requestId, { process: ytDlpProcess, res });
+            activeTasks.set(requestId, { process: ytDlpProcess });
 
-            // 3. ATOMIC KILL SWITCH: If user cancels or closes tab
+            // Kill Switch
             req.on('close', () => {
-                console.log(`[Safety] User cancelled. Killing process ${requestId}`);
-                ytDlpProcess.kill('SIGKILL');
-                // Cleanup any partial files immediately
-                const partialFile = path.join(downloadFolder, `${fileId}.${format}`);
-                if (fs.existsSync(partialFile)) fs.unlink(partialFile, () => {});
+                const task = activeTasks.get(requestId);
+                if (task) {
+                    console.log(`[Safety] User cancelled. Killing process ${requestId}`);
+                    task.process.kill('SIGKILL');
+                    const partialFile = path.join(downloadFolder, `${fileId}.${format}`);
+                    if (fs.existsSync(partialFile)) fs.unlink(partialFile, () => {});
+                }
             });
 
             let dataBuffer = '';
@@ -313,31 +302,53 @@ router.post('/convert', async (req, res) => {
                 activeTasks.delete(requestId);
 
                 if (signal === 'SIGKILL' || code !== 0) {
-                    if (!res.headersSent) res.status(500).json({ error: "Job Interrupted" });
+                    sendUpdate({ status: 'Error', message: 'Download interrupted' });
                     return;
                 }
 
                 sendUpdate({ progress: 100, status: 'Complete' });
 
+                // MARK FILE AS READY FOR PICKUP
                 const expectedFile = path.join(downloadFolder, `${fileId}.${format}`);
                 if (fs.existsSync(expectedFile)) {
-                    if (!res.headersSent) {
-                        res.download(expectedFile, `download.${format}`, (err) => {
-                            // 4. FINAL CLEANUP: Delete file immediately after successful or failed transfer
-                            fs.unlink(expectedFile, () => {
-                                console.log(`[Cleanup] Deleted ${fileId}`);
-                            });
-                        });
-                    }
+                    completedJobs.set(requestId, expectedFile);
+                    // Auto-delete if not picked up in 5 mins
+                    setTimeout(() => {
+                        if (completedJobs.has(requestId)) {
+                            completedJobs.delete(requestId);
+                            fs.unlink(expectedFile, () => {});
+                        }
+                    }, 5 * 60 * 1000);
                 }
             });
         });
     };
 
+    // Return "Queued" IMMEDIATELY to prevent Vercel Timeout
     const result = downloadQueue.add(requestId, startJob);
     if (result.status === 'queued') {
         sendUpdate({ status: 'Queued', position: result.position });
     }
+    
+    // IMPORTANT: We respond here instantly. The browser waits for SSE 'Complete'
+    res.json({ message: "Job Started", ticketId: requestId });
+});
+
+// 6. DOWNLOAD ROUTE (The Pickup Counter)
+router.get('/download-file', (req, res) => {
+    const { requestId } = req.query;
+    const filePath = completedJobs.get(requestId);
+
+    if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).send("File expired or not found. Please try again.");
+    }
+
+    const filename = `download${path.extname(filePath)}`;
+    res.download(filePath, filename, (err) => {
+        // Delete immediately after sending
+        completedJobs.delete(requestId);
+        fs.unlink(filePath, () => console.log(`[Cleanup] Delivered & Deleted ${requestId}`));
+    });
 });
 
 export default router;

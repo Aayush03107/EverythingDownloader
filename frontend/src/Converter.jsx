@@ -156,6 +156,8 @@ const Converter = () => {
       setStatus(`Batch: ${i + 1}/${queue.length} - ${queue[i].title.substring(0, 20)}...`);
       try {
         await handleDownload(queue[i].url, queue[i].title);
+        // Small delay to prevent browser block
+        await new Promise(r => setTimeout(r, 1000));
       } catch (e) {
         console.error("Batch failure for:", queue[i].title);
       }
@@ -175,24 +177,38 @@ const Converter = () => {
     abortControllerRef.current = new AbortController();
 
     return new Promise(async (resolve, reject) => {
+      // 1. SETUP LISTENER
       const eventSource = new EventSource(`${API_URL}/events?requestId=${requestId}`);
       eventSourceRef.current = eventSource;
 
       eventSource.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        
         if (data.status === 'Downloading') {
           setProgress(data.progress);
           if (data.total !== '...') setDownloadDetails({ total: data.total, speed: data.speed });
           if (!isPlaylist) setStatus(`Downloading ${Math.round(data.progress)}%`);
-        } else if (data.status === 'Complete') {
+        } 
+        else if (data.status === 'Complete') {
           setProgress(100);
           eventSource.close();
-        } else if (data.status === 'Error') {
+          
+          // 3. PICKUP THE FILE (Redirect to GET route)
+          if (!isPlaylist) setStatus('Download complete');
+          if (!isPlaylist) setLoading(false);
+          
+          // Trigger file save
+          window.location.href = `${API_URL}/download-file?requestId=${requestId}`;
+          resolve();
+        } 
+        else if (data.status === 'Error') {
           eventSource.close();
+          setStatus(`Error: ${data.message || 'Failed'}`);
           reject();
         }
       };
 
+      // 2. START THE JOB
       try {
         const response = await fetch(`${API_URL}/convert`, {
           method: 'POST',
@@ -206,21 +222,8 @@ const Converter = () => {
           signal: abortControllerRef.current.signal
         });
 
-        if (!response.ok) throw new Error('Download failed');
-        
-        const blob = await response.blob();
-        const dUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = dUrl;
-        a.download = `${targetTitle || 'download'}.${format}`;
-        a.click();
-        URL.revokeObjectURL(dUrl);
-
-        if (!isPlaylist) {
-          setStatus('Download complete');
-          setLoading(false);
-        }
-        resolve();
+        if (!response.ok) throw new Error('Failed to start download');
+        // Note: We DO NOT await blob() here. We wait for SSE 'Complete' instead.
       } catch (e) {
         if (e.name !== 'AbortError') setStatus(`Failed: ${e.message}`);
         setLoading(false);
