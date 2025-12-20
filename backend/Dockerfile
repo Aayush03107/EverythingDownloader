@@ -1,33 +1,32 @@
 # backend/Dockerfile
 
-# 1. Start with a lightweight Linux system that has Node.js 18 installed
-FROM node:18-alpine
+# CHANGE: Use Node 20 (This has the 'File' API built-in)
+FROM node:20-alpine
 
-# 2. Install the tools we need (Python, Pip, FFmpeg)
+# Install system dependencies
 RUN apk add --no-cache python3 py3-pip ffmpeg
 
-# 3. Create a virtual environment for Python (Recommended for newer Linux versions)
+# Setup Python Virtual Env
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# 4. Install yt-dlp using Pip
+# Install yt-dlp
 RUN pip3 install yt-dlp
 
-# 5. Create a folder inside the box for our app
 WORKDIR /app
 
-# 6. Copy our package files first (for better caching)
+# Copy package files
 COPY package*.json ./
 
-# 7. Install our Node.js dependencies
+# Install dependencies
 RUN npm install
 
-# 8. Copy the rest of our backend code into the box
+# Copy all app files
 COPY . .
 
-# 9. Open port 3000
+# Open the port
 EXPOSE 3000
 
-# 10. Start the server
-CMD ["node", "index.js"]
+# Start the server
+CMD ["node", "server.mjs"]
