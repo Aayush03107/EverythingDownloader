@@ -22,12 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-# Security & Local Config
+
 cookies.txt
 backend/cookies.txt
-.env
-backend/.env
-
-# Downloads folder (don't upload videos to GitHub)
 downloads/
-backend/downloads/
