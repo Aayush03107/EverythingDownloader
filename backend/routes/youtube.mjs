@@ -189,7 +189,6 @@ router.get('/formats', async (req, res) => {
     const cached = metaCache.get(cacheKey);
     if (cached) return res.json({ formats: cached });
 
-    // Use spawn to safely handle arguments (prevents shell crashes)
     const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
     const args = [
         '--user-agent', userAgent,
@@ -202,10 +201,8 @@ router.get('/formats', async (req, res) => {
 
     let stdout = '';
     
-    // IMPORTANT: Handle startup errors to prevent crash
     child.on('error', (err) => {
         console.error("Format Check Error:", err);
-        // Do not reply if already replied
         if (!res.headersSent) res.json({ formats: [] });
     });
 
@@ -261,7 +258,7 @@ router.get('/formats', async (req, res) => {
     });
 });
 
-// 5. CONVERT ROUTE (Fixed Typo & Crash)
+// 5. CONVERT ROUTE (UPDATED: Handles Render Secrets)
 router.post('/convert', async (req, res) => {
     const { url, format, quality, requestId } = req.body;
     if (!url) return res.status(400).json({ error: "No URL" });
@@ -277,13 +274,22 @@ router.post('/convert', async (req, res) => {
         console.log(`[Queue] Starting Job: ${requestId}`);
         sendUpdate({ status: 'Downloading', progress: 0, total: '...', speed: '...' });
 
-        const cookiePath = path.join(rootDir, 'cookies.txt');
-        const hasCookies = fs.existsSync(cookiePath);
-        if (hasCookies) console.log(`[Auth] Using cookies.txt for ${requestId}`);
+        // --- AUTH CHECK: Local vs Render ---
+        const localCookies = path.join(rootDir, 'cookies.txt');
+        const renderCookies = '/etc/secrets/cookies.txt'; // Render's default secret path
+
+        let activeCookiePath = null;
+        
+        if (fs.existsSync(localCookies)) {
+            activeCookiePath = localCookies;
+            console.log(`[Auth] Using LOCAL cookies.txt for ${requestId}`);
+        } else if (fs.existsSync(renderCookies)) {
+            activeCookiePath = renderCookies;
+            console.log(`[Auth] Using RENDER cookies.txt for ${requestId}`);
+        }
 
         // Get size check
         exec(`yt-dlp --get-size "${url}"`, async (err, stdout) => {
-            // Note: exec callback handles err, doesn't crash process usually
             const freeSpace = await getFreeDiskSpace();
             const isTooLarge = stdout && (stdout.includes('G') || (stdout.includes('M') && parseFloat(stdout) > 500));
 
@@ -306,12 +312,12 @@ router.post('/convert', async (req, res) => {
                 '--max-filesize', '500M',
                 '--user-agent', userAgent,
                 '--referer', 'https://www.google.com/',
-                '--no-check-certificate', // Corrected Flag
+                '--no-check-certificate', 
                 '--geo-bypass' 
             ]; 
 
-            if (hasCookies) {
-                baseArgs.push('--cookies', cookiePath);
+            if (activeCookiePath) {
+                baseArgs.push('--cookies', activeCookiePath);
             }
 
             let args = [];
@@ -326,7 +332,6 @@ router.post('/convert', async (req, res) => {
 
             let errorLog = '';
 
-            // --- CRITICAL FIX: Handle Spawn Errors ---
             ytDlpProcess.on('error', (spawnErr) => {
                 console.error(`[Spawn Error] ${spawnErr}`);
                 sendUpdate({ status: 'Error', message: 'Internal Server Error: Failed to start downloader.' });
