@@ -24,7 +24,6 @@ app.use(express.json());
 // Scan every 10 mins. Delete files older than 30 mins.
 startJanitor(__dirname, 10, 30);
 
-// Routes
 app.use('/api/playlist', playlistRoutes);
 app.use('/', youtubeRoutes);
 

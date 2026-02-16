@@ -5,9 +5,9 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import * as cheerio from 'cheerio';
-import uid from 'uid-safe'; // Use uid-safe for file IDs
+import uid from 'uid-safe'; 
 
-// --- UTILS (Fixed Spelling) ---
+// --- UTILS ---
 import { validateURL } from '../utitlis/security.mjs';
 import { Cache, RateLimiter } from '../utitlis/limiter.mjs';
 import { JobQueue } from '../utitlis/queue.mjs';
@@ -17,6 +17,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.join(__dirname, '..');
 
+// --- SAFETY NET: Prevent Server Crashes ---
+process.on('uncaughtException', (err) => {
+    console.error('CRITICAL ERROR (Prevents Crash):', err);
+});
+
 // --- INIT SYSTEMS ---
 const metaCache = new Cache(30); 
 const limiter = new RateLimiter(60, 60); 
@@ -24,8 +29,8 @@ const downloadQueue = new JobQueue(2);
 
 // --- GLOBAL STATE ---
 const activeTasks = new Map(); 
-const clients = new Map();      
-const completedJobs = new Map(); // Stores paths of finished files for pickup
+const clients = new Map();       
+const completedJobs = new Map(); 
 
 // --- HELPERS ---
 const isSpotifyUrl = (url) => url.includes('spotify');
@@ -83,9 +88,19 @@ const getOEmbedMeta = async (videoUrl) => {
 
 const getUniversalMeta = (url) => {
     return new Promise((resolve) => {
-        const command = `yt-dlp --dump-single-json --flat-playlist --playlist-items 1 --no-warnings "${url}"`;
-        exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout) => {
-            if (error) return resolve(null);
+        // Use spawn instead of exec to prevent shell crashes
+        const child = spawn('yt-dlp', ['--dump-single-json', '--flat-playlist', '--playlist-items', '1', '--no-warnings', url]);
+        
+        let stdout = '';
+        child.stdout.on('data', (data) => stdout += data.toString());
+        
+        child.on('error', (err) => {
+            console.error("Meta Fetch Spawn Error:", err);
+            resolve(null);
+        });
+
+        child.on('close', (code) => {
+            if (code !== 0) return resolve(null);
             try {
                 const info = JSON.parse(stdout);
                 resolve({
@@ -163,7 +178,7 @@ router.get('/meta', async (req, res) => {
     return res.status(500).json({ error: "Link not supported" });
 });
 
-// 4. FORMATS ROUTE
+// 4. FORMATS ROUTE (CRASH FIXED)
 router.get('/formats', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.json({ formats: [] });
@@ -174,10 +189,34 @@ router.get('/formats', async (req, res) => {
     const cached = metaCache.get(cacheKey);
     if (cached) return res.json({ formats: cached });
 
-    const command = `yt-dlp --print "%(height)s|%(filesize)s|%(filesize_approx)s|%(playlist_count)s" --playlist-items 1 "${url}"`;
+    // Use spawn to safely handle arguments (prevents shell crashes)
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
+    const args = [
+        '--user-agent', userAgent,
+        '--print', '%(height)s|%(filesize)s|%(filesize_approx)s|%(playlist_count)s',
+        '--playlist-items', '1',
+        url
+    ];
+
+    const child = spawn('yt-dlp', args);
+
+    let stdout = '';
     
-    exec(command, { maxBuffer: 1024 * 1024 }, (error, stdout) => {
-        if (error) return res.json({ formats: [] });
+    // IMPORTANT: Handle startup errors to prevent crash
+    child.on('error', (err) => {
+        console.error("Format Check Error:", err);
+        // Do not reply if already replied
+        if (!res.headersSent) res.json({ formats: [] });
+    });
+
+    child.stdout.on('data', (data) => stdout += data.toString());
+
+    child.on('close', (code) => {
+        if (code !== 0 || !stdout) {
+            if (!res.headersSent) res.json({ formats: [] });
+            return;
+        }
+        
         try {
             const lines = stdout.trim().split('\n');
             const formatMap = new Map();
@@ -215,12 +254,14 @@ router.get('/formats', async (req, res) => {
                 });
 
             metaCache.set(cacheKey, formats);
-            res.json({ formats });
-        } catch (e) { res.json({ formats: [] }); }
+            if (!res.headersSent) res.json({ formats });
+        } catch (e) { 
+            if (!res.headersSent) res.json({ formats: [] }); 
+        }
     });
 });
 
-// 5. CONVERT ROUTE (The Start Point)
+// 5. CONVERT ROUTE (Fixed Typo & Crash)
 router.post('/convert', async (req, res) => {
     const { url, format, quality, requestId } = req.body;
     if (!url) return res.status(400).json({ error: "No URL" });
@@ -236,15 +277,18 @@ router.post('/convert', async (req, res) => {
         console.log(`[Queue] Starting Job: ${requestId}`);
         sendUpdate({ status: 'Downloading', progress: 0, total: '...', speed: '...' });
 
-        // Pre-Check: Size & Disk
+        const cookiePath = path.join(rootDir, 'cookies.txt');
+        const hasCookies = fs.existsSync(cookiePath);
+        if (hasCookies) console.log(`[Auth] Using cookies.txt for ${requestId}`);
+
+        // Get size check
         exec(`yt-dlp --get-size "${url}"`, async (err, stdout) => {
+            // Note: exec callback handles err, doesn't crash process usually
             const freeSpace = await getFreeDiskSpace();
-            const isTooLarge = stdout.includes('G') || (stdout.includes('M') && parseFloat(stdout) > 500);
+            const isTooLarge = stdout && (stdout.includes('G') || (stdout.includes('M') && parseFloat(stdout) > 500));
 
             if (isTooLarge || freeSpace < 200) {
                 sendUpdate({ status: 'Error', message: 'File too large or server disk full' });
-                // Note: We cannot send res.json here because we already sent it below!
-                // The frontend relies on the SSE 'Error' status.
                 downloadQueue.next(); 
                 return;
             }
@@ -254,9 +298,23 @@ router.post('/convert', async (req, res) => {
             if (!fs.existsSync(downloadFolder)) fs.mkdirSync(downloadFolder);
             const outputTemplate = path.join(downloadFolder, `${fileId}.%(ext)s`);
 
-            const baseArgs = ['--newline', '--no-warnings', '--max-filesize', '500M']; 
-            let args = [];
+            const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
+            
+            const baseArgs = [
+                '--newline', 
+                '--no-warnings', 
+                '--max-filesize', '500M',
+                '--user-agent', userAgent,
+                '--referer', 'https://www.google.com/',
+                '--no-check-certificate', // Corrected Flag
+                '--geo-bypass' 
+            ]; 
 
+            if (hasCookies) {
+                baseArgs.push('--cookies', cookiePath);
+            }
+
+            let args = [];
             if (format === 'mp3') {
                 args = [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', '-o', outputTemplate, url];
             } else {
@@ -266,15 +324,20 @@ router.post('/convert', async (req, res) => {
             const ytDlpProcess = spawn('yt-dlp', args);
             activeTasks.set(requestId, { process: ytDlpProcess });
 
-            // Kill Switch
-            req.on('close', () => {
-                const task = activeTasks.get(requestId);
-                if (task) {
-                    console.log(`[Safety] User cancelled. Killing process ${requestId}`);
-                    task.process.kill('SIGKILL');
-                    const partialFile = path.join(downloadFolder, `${fileId}.${format}`);
-                    if (fs.existsSync(partialFile)) fs.unlink(partialFile, () => {});
-                }
+            let errorLog = '';
+
+            // --- CRITICAL FIX: Handle Spawn Errors ---
+            ytDlpProcess.on('error', (spawnErr) => {
+                console.error(`[Spawn Error] ${spawnErr}`);
+                sendUpdate({ status: 'Error', message: 'Internal Server Error: Failed to start downloader.' });
+                downloadQueue.next();
+                activeTasks.delete(requestId);
+            });
+
+            ytDlpProcess.stderr.on('data', (data) => {
+                const msg = data.toString();
+                errorLog += msg; 
+                console.error(`[yt-dlp stderr] ${msg}`);
             });
 
             let dataBuffer = '';
@@ -301,40 +364,53 @@ router.post('/convert', async (req, res) => {
                 downloadQueue.next();
                 activeTasks.delete(requestId);
 
-                if (signal === 'SIGKILL' || code !== 0) {
-                    sendUpdate({ status: 'Error', message: 'Download interrupted' });
+                if (signal === 'SIGKILL') {
+                    sendUpdate({ status: 'Error', message: 'Download cancelled by user.' });
+                    return;
+                }
+
+                if (code !== 0) {
+                    const cleanError = errorLog.slice(0, 300) || "Unknown error occurred";
+                    let userFriendlyError = cleanError;
+                    
+                    if (cleanError.includes('403') || cleanError.includes('Forbidden')) {
+                        userFriendlyError = "Server IP Blocked by YouTube. Please try again later or add cookies.txt to backend.";
+                    }
+
+                    console.log(`[Job Failed] Code: ${code} | Log: ${cleanError}`);
+                    sendUpdate({ status: 'Error', message: userFriendlyError });
                     return;
                 }
 
                 sendUpdate({ progress: 100, status: 'Complete' });
 
-                // MARK FILE AS READY FOR PICKUP
-                const expectedFile = path.join(downloadFolder, `${fileId}.${format}`);
+                const actualExt = format === 'mp3' ? 'mp3' : 'mp4';
+                const expectedFile = path.join(downloadFolder, `${fileId}.${actualExt}`);
+                
                 if (fs.existsSync(expectedFile)) {
                     completedJobs.set(requestId, expectedFile);
-                    // Auto-delete if not picked up in 5 mins
                     setTimeout(() => {
                         if (completedJobs.has(requestId)) {
                             completedJobs.delete(requestId);
                             fs.unlink(expectedFile, () => {});
                         }
                     }, 5 * 60 * 1000);
+                } else {
+                     sendUpdate({ status: 'Error', message: 'File not found after download' });
                 }
             });
         });
     };
 
-    // Return "Queued" IMMEDIATELY to prevent Vercel Timeout
     const result = downloadQueue.add(requestId, startJob);
     if (result.status === 'queued') {
         sendUpdate({ status: 'Queued', position: result.position });
     }
     
-    // IMPORTANT: We respond here instantly. The browser waits for SSE 'Complete'
     res.json({ message: "Job Started", ticketId: requestId });
 });
 
-// 6. DOWNLOAD ROUTE (The Pickup Counter)
+// 6. DOWNLOAD ROUTE
 router.get('/download-file', (req, res) => {
     const { requestId } = req.query;
     const filePath = completedJobs.get(requestId);
@@ -345,7 +421,6 @@ router.get('/download-file', (req, res) => {
 
     const filename = `download${path.extname(filePath)}`;
     res.download(filePath, filename, (err) => {
-        // Delete immediately after sending
         completedJobs.delete(requestId);
         fs.unlink(filePath, () => console.log(`[Cleanup] Delivered & Deleted ${requestId}`));
     });
