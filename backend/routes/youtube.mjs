@@ -88,7 +88,6 @@ const getOEmbedMeta = async (videoUrl) => {
 
 const getUniversalMeta = (url) => {
     return new Promise((resolve) => {
-        // Use spawn instead of exec to prevent shell crashes
         const child = spawn('yt-dlp', ['--dump-single-json', '--flat-playlist', '--playlist-items', '1', '--no-warnings', url]);
         
         let stdout = '';
@@ -178,7 +177,7 @@ router.get('/meta', async (req, res) => {
     return res.status(500).json({ error: "Link not supported" });
 });
 
-// 4. FORMATS ROUTE (CRASH FIXED)
+// 4. FORMATS ROUTE
 router.get('/formats', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.json({ formats: [] });
@@ -258,7 +257,7 @@ router.get('/formats', async (req, res) => {
     });
 });
 
-// 5. CONVERT ROUTE (UPDATED: Handles Render Secrets)
+// 5. CONVERT ROUTE
 router.post('/convert', async (req, res) => {
     const { url, format, quality, requestId } = req.body;
     if (!url) return res.status(400).json({ error: "No URL" });
@@ -276,8 +275,7 @@ router.post('/convert', async (req, res) => {
 
         // --- AUTH CHECK: Local vs Render ---
         const localCookies = path.join(rootDir, 'cookies.txt');
-        const renderCookies = '/etc/secrets/cookies.txt'; // Render's default secret path
-
+        const renderCookies = '/etc/secrets/cookies.txt'; 
         let activeCookiePath = null;
         
         if (fs.existsSync(localCookies)) {
@@ -288,7 +286,6 @@ router.post('/convert', async (req, res) => {
             console.log(`[Auth] Using RENDER cookies.txt for ${requestId}`);
         }
 
-        // Get size check
         exec(`yt-dlp --get-size "${url}"`, async (err, stdout) => {
             const freeSpace = await getFreeDiskSpace();
             const isTooLarge = stdout && (stdout.includes('G') || (stdout.includes('M') && parseFloat(stdout) > 500));
@@ -324,7 +321,14 @@ router.post('/convert', async (req, res) => {
             if (format === 'mp3') {
                 args = [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', '-o', outputTemplate, url];
             } else {
-                args = [...baseArgs, '-f', `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`, '--merge-output-format', 'mp4', '-o', outputTemplate, url];
+                // FIXED: More robust format selection with fallback
+                args = [
+                    ...baseArgs, 
+                    '-f', `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/bestvideo+bestaudio/best`, 
+                    '--merge-output-format', 'mp4', 
+                    '-o', outputTemplate, 
+                    url
+                ];
             }
 
             const ytDlpProcess = spawn('yt-dlp', args);
@@ -380,6 +384,8 @@ router.post('/convert', async (req, res) => {
                     
                     if (cleanError.includes('403') || cleanError.includes('Forbidden')) {
                         userFriendlyError = "Server IP Blocked by YouTube. Please try again later or add cookies.txt to backend.";
+                    } else if (cleanError.includes('Requested format is not available')) {
+                        userFriendlyError = "Desired quality not available, try a different resolution.";
                     }
 
                     console.log(`[Job Failed] Code: ${code} | Log: ${cleanError}`);
